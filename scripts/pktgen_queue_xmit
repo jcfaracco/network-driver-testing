@@ -16,7 +16,7 @@ source ${basedir}/lib/parameters
 if [ -z "$DEST_IP" ]; then
     [ -z "$IP6" ] && DEST_IP="198.18.0.42" || DEST_IP="FD00::1"
 fi
-[ -z "$DST_MAC" ] && DST_MAC="90:e2:ba:ff:ff:ff"
+[ -z "$DST_MAC" ] && DST_MAC=$(get_mac_address $DEV)
 
 # Burst greater than 1 are invalid for queue_xmit mode
 if [[ -n "$BURST" ]]; then
