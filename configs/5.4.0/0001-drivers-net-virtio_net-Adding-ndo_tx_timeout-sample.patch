@@ -1,0 +1,311 @@
+From efd45a717f9d354a386bf16f6b3e57b4551674f8 Mon Sep 17 00:00:00 2001
+From: Julio Faracco <jcfaracco@gmail.com>
+Date: Wed, 13 Nov 2019 16:05:44 -0300
+Subject: [PATCH 1/2] drivers: net: virtio_net: Adding ndo_tx_timeout sample.
+
+Signed-off-by: Julio Faracco <jcfaracco@gmail.com>
+---
+ drivers/net/virtio_net.c | 170 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 169 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 5a635f028bd..d343cc16ae5 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -55,6 +55,14 @@ DECLARE_EWMA(pkt_len, 0, 64)
+ 
+ #define VIRTNET_DRIVER_VERSION "1.0.0"
+ 
++static const char virtnet_gstrings_test[][ETH_GSTRING_LEN] = {
++        "Reset test     (offline)",
++	"Loopback test  (offline)",
++};
++
++#define VIRTNET_TEST_LEN	ARRAY_SIZE(virtnet_gstrings_test)
++#define VIRTNET_LOOPBACK_TEST_PAYLOAD	(128 - NET_IP_ALIGN - ETH_HLEN)
++
+ static const unsigned long guest_offloads[] = {
+ 	VIRTIO_NET_F_GUEST_TSO4,
+ 	VIRTIO_NET_F_GUEST_TSO6,
+@@ -75,6 +83,7 @@ struct virtnet_sq_stats {
+ 	u64 xdp_tx;
+ 	u64 xdp_tx_drops;
+ 	u64 kicks;
++	u64 tx_timeouts;
+ };
+ 
+ struct virtnet_rq_stats {
+@@ -98,6 +107,7 @@ static const struct virtnet_stat_desc virtnet_sq_stats_desc[] = {
+ 	{ "xdp_tx",		VIRTNET_SQ_STAT(xdp_tx) },
+ 	{ "xdp_tx_drops",	VIRTNET_SQ_STAT(xdp_tx_drops) },
+ 	{ "kicks",		VIRTNET_SQ_STAT(kicks) },
++	{ "tx_timeouts",	VIRTNET_SQ_STAT(tx_timeouts) },
+ };
+ 
+ static const struct virtnet_stat_desc virtnet_rq_stats_desc[] = {
+@@ -211,6 +221,9 @@ struct virtnet_info {
+ 	/* Work struct for config space updates */
+ 	struct work_struct config_work;
+ 
++	/* Work struct for resetting the virtio-net driver. */
++	struct work_struct reset_work;
++
+ 	/* Does the affinity hint is set for virtqueues? */
+ 	bool affinity_hint_set;
+ 
+@@ -1721,7 +1734,7 @@ static void virtnet_stats(struct net_device *dev,
+ 	int i;
+ 
+ 	for (i = 0; i < vi->max_queue_pairs; i++) {
+-		u64 tpackets, tbytes, rpackets, rbytes, rdrops;
++		u64 tpackets, tbytes, terrors, rpackets, rbytes, rdrops;
+ 		struct receive_queue *rq = &vi->rq[i];
+ 		struct send_queue *sq = &vi->sq[i];
+ 
+@@ -1729,6 +1742,7 @@ static void virtnet_stats(struct net_device *dev,
+ 			start = u64_stats_fetch_begin_irq(&sq->stats.syncp);
+ 			tpackets = sq->stats.packets;
+ 			tbytes   = sq->stats.bytes;
++			terrors  = sq->stats.tx_timeouts;
+ 		} while (u64_stats_fetch_retry_irq(&sq->stats.syncp, start));
+ 
+ 		do {
+@@ -1743,6 +1757,7 @@ static void virtnet_stats(struct net_device *dev,
+ 		tot->rx_bytes   += rbytes;
+ 		tot->tx_bytes   += tbytes;
+ 		tot->rx_dropped += rdrops;
++		tot->tx_errors  += terrors;
+ 	}
+ 
+ 	tot->tx_dropped = dev->stats.tx_dropped;
+@@ -2083,6 +2098,9 @@ static void virtnet_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ 	unsigned int i, j;
+ 
+ 	switch (stringset) {
++	case ETH_SS_TEST:
++		memcpy(data, virtnet_gstrings_test, sizeof(virtnet_gstrings_test));
++                break;
+ 	case ETH_SS_STATS:
+ 		for (i = 0; i < vi->curr_queue_pairs; i++) {
+ 			for (j = 0; j < VIRTNET_RQ_STATS_LEN; j++) {
+@@ -2103,11 +2121,76 @@ static void virtnet_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ 	}
+ }
+ 
++static int virtnet_test_loopback_xmit(struct virtnet_info *vi)
++{
++	struct net_device *dev = vi->dev;
++        struct sk_buff *skb;
++        struct ethhdr *ethh;
++        unsigned char *packet;
++        unsigned int packet_size = VIRTNET_LOOPBACK_TEST_PAYLOAD;
++        unsigned int i;
++        int err;
++
++
++        /* build the pkt before xmit */
++        skb = netdev_alloc_skb(dev, packet_size + ETH_HLEN + NET_IP_ALIGN);
++        if (!skb)
++                return -ENOMEM;
++
++        skb_reserve(skb, NET_IP_ALIGN);
++
++        ethh = skb_put(skb, sizeof(struct ethhdr));
++        packet = skb_put(skb, packet_size);
++        memcpy(ethh->h_dest, dev->dev_addr, ETH_ALEN);
++        eth_zero_addr(ethh->h_source);
++        ethh->h_proto = htons(ETH_P_ARP);
++        skb_reset_mac_header(skb);
++        for (i = 0; i < packet_size; ++i)       /* fill our packet */
++                packet[i] = (unsigned char)(i & 0xff);
++
++        /* xmit the pkt */
++        err = start_xmit(skb, dev);
++        return err;
++}
++
++static int _virtnet_reset(struct virtnet_info *vi);
++
++static void virtnet_self_test(struct net_device *netdev,
++			    struct ethtool_test *eth_test, u64 *data)
++{
++	struct virtnet_info *vi = netdev_priv(netdev);
++	int ret;
++
++	memset(data, 0, sizeof(u64) * VIRTNET_TEST_LEN);
++
++	if (eth_test->flags == ETH_TEST_FL_OFFLINE) {
++		if (!netif_running(netdev)) {
++			dev_warn(&vi->dev->dev, "Failed to execute self test.\n");
++			eth_test->flags |= ETH_TEST_FL_FAILED;
++			return;
++		}
++
++		ret = _virtnet_reset(vi);
++		if (ret) {
++			eth_test->flags |= ETH_TEST_FL_FAILED;
++			data[0] = ret;
++		}
++
++		ret = virtnet_test_loopback_xmit(vi);
++		if (ret) {
++                        eth_test->flags |= ETH_TEST_FL_FAILED;
++                        data[1] = ret;
++                }
++	}
++}
++
+ static int virtnet_get_sset_count(struct net_device *dev, int sset)
+ {
+ 	struct virtnet_info *vi = netdev_priv(dev);
+ 
+ 	switch (sset) {
++	case ETH_SS_TEST:
++                return VIRTNET_TEST_LEN;
+ 	case ETH_SS_STATS:
+ 		return vi->curr_queue_pairs * (VIRTNET_RQ_STATS_LEN +
+ 					       VIRTNET_SQ_STATS_LEN);
+@@ -2304,6 +2387,7 @@ static const struct ethtool_ops virtnet_ethtool_ops = {
+ 	.get_ethtool_stats = virtnet_get_ethtool_stats,
+ 	.set_channels = virtnet_set_channels,
+ 	.get_channels = virtnet_get_channels,
++	.self_test = virtnet_self_test,
+ 	.get_ts_info = ethtool_op_get_ts_info,
+ 	.get_link_ksettings = virtnet_get_link_ksettings,
+ 	.set_link_ksettings = virtnet_set_link_ksettings,
+@@ -2581,6 +2665,28 @@ static int virtnet_set_features(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static void virtnet_tx_timeout(struct net_device *dev)
++{
++	struct virtnet_info *vi = netdev_priv(dev);
++	u32 i;
++
++	/* find the stopped queue the same way dev_watchdog() does */
++	for (i = 0; i < vi->curr_queue_pairs; i++) {
++		struct send_queue *sq = &vi->sq[i];
++
++		if (!netif_xmit_stopped(netdev_get_tx_queue(dev, i)))
++			continue;
++
++		u64_stats_update_begin(&sq->stats.syncp);
++		sq->stats.tx_timeouts++;
++		u64_stats_update_end(&sq->stats.syncp);
++
++		dev->stats.tx_errors++;
++	}
++
++	schedule_work(&vi->reset_work);
++}
++
+ static const struct net_device_ops virtnet_netdev = {
+ 	.ndo_open            = virtnet_open,
+ 	.ndo_stop   	     = virtnet_close,
+@@ -2596,6 +2702,7 @@ static const struct net_device_ops virtnet_netdev = {
+ 	.ndo_features_check	= passthru_features_check,
+ 	.ndo_get_phys_port_name	= virtnet_get_phys_port_name,
+ 	.ndo_set_features	= virtnet_set_features,
++	.ndo_tx_timeout		= virtnet_tx_timeout,
+ };
+ 
+ static void virtnet_config_changed_work(struct work_struct *work)
+@@ -2985,6 +3092,14 @@ static int virtnet_validate(struct virtio_device *vdev)
+ 	return 0;
+ }
+ 
++static void virtnet_reset(struct work_struct *work)
++{
++        struct virtnet_info *vi =
++                container_of(work, struct virtnet_info, reset_work);
++
++        _virtnet_reset(vi);
++}
++
+ static int virtnet_probe(struct virtio_device *vdev)
+ {
+ 	int i, err = -ENOMEM;
+@@ -3014,6 +3129,7 @@ static int virtnet_probe(struct virtio_device *vdev)
+ 	dev->netdev_ops = &virtnet_netdev;
+ 	dev->features = NETIF_F_HIGHDMA;
+ 
++	dev->watchdog_timeo = 5 * HZ;
+ 	dev->ethtool_ops = &virtnet_ethtool_ops;
+ 	SET_NETDEV_DEV(dev, &vdev->dev);
+ 
+@@ -3071,6 +3187,7 @@ static int virtnet_probe(struct virtio_device *vdev)
+ 	vdev->priv = vi;
+ 
+ 	INIT_WORK(&vi->config_work, virtnet_config_changed_work);
++	INIT_WORK(&vi->reset_work, virtnet_reset);
+ 
+ 	/* If we can receive ANY GSO packets, we must allocate large ones. */
+ 	if (virtio_has_feature(vdev, VIRTIO_NET_F_GUEST_TSO4) ||
+@@ -3201,6 +3318,20 @@ static int virtnet_probe(struct virtio_device *vdev)
+ 	return err;
+ }
+ 
++static void _remove_vq_common(struct virtnet_info *vi)
++{
++        vi->vdev->config->reset(vi->vdev);
++
++        /* Free unused buffers in both send and recv, if any. */
++        free_unused_bufs(vi);
++
++        _free_receive_bufs(vi);
++
++        free_receive_page_frags(vi);
++
++        virtnet_del_vqs(vi);
++}
++
+ static void remove_vq_common(struct virtnet_info *vi)
+ {
+ 	vi->vdev->config->reset(vi->vdev);
+@@ -3261,6 +3392,43 @@ static __maybe_unused int virtnet_restore(struct virtio_device *vdev)
+ 	return 0;
+ }
+ 
++static int _virtnet_reset(struct virtnet_info *vi)
++{
++	struct virtio_device *vdev = vi->vdev;
++	int ret;
++
++	virtio_config_disable(vdev);
++	vdev->failed = vdev->config->get_status(vdev) & VIRTIO_CONFIG_S_FAILED;
++
++	virtnet_freeze_down(vdev);
++	_remove_vq_common(vi);
++
++	virtio_add_status(vdev, VIRTIO_CONFIG_S_ACKNOWLEDGE);
++	virtio_add_status(vdev, VIRTIO_CONFIG_S_DRIVER);
++
++	ret = virtio_finalize_features(vdev);
++	if (ret)
++		goto err;
++
++//	vi->xdp_queue_pairs = xdp_qp;
++	ret = virtnet_restore_up(vdev);
++	if (ret)
++		goto err;
++
++	ret = _virtnet_set_queues(vi, vi->curr_queue_pairs);
++	if (ret)
++		goto err;
++
++	virtio_add_status(vdev, VIRTIO_CONFIG_S_DRIVER_OK);
++	virtio_config_enable(vdev);
++	dev_warn(&vdev->dev, "Device was successfully reseted!\n");
++	return 0;
++err:
++	virtio_add_status(vdev, VIRTIO_CONFIG_S_FAILED);
++	dev_warn(&vdev->dev, "Device was not successfully reseted!\n");
++	return ret;
++}
++
+ static struct virtio_device_id id_table[] = {
+ 	{ VIRTIO_ID_NET, VIRTIO_DEV_ANY_ID },
+ 	{ 0 },
+-- 
+2.17.1
+

@@ -1,0 +1,52 @@
+From 628c38ed7b33decb157c3246a7686cd21c09eff2 Mon Sep 17 00:00:00 2001
+From: Julio Faracco <jcfaracco@gmail.com>
+Date: Wed, 20 Nov 2019 10:17:17 -0300
+Subject: [PATCH 2/2] net: sched: hack to simulate tx_timeout event
+
+Signed-off-by: Julio Faracco <jcfaracco@gmail.com>
+---
+ drivers/net/virtio_net.c | 4 ++--
+ net/sched/sch_generic.c  | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index d343cc16ae5..c24c575acd1 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1572,7 +1572,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	bool use_napi = sq->napi.weight;
+ 
+ 	/* Free up any pending old buffers before queueing new ones. */
+-	free_old_xmit_skbs(sq, false);
++//	free_old_xmit_skbs(sq, false);
+ 
+ 	if (use_napi && kick)
+ 		virtqueue_enable_cb_delayed(sq->vq);
+@@ -1616,7 +1616,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		if (!use_napi &&
+ 		    unlikely(!virtqueue_enable_cb_delayed(sq->vq))) {
+ 			/* More just got used, free them then recheck. */
+-			free_old_xmit_skbs(sq, false);
++//			free_old_xmit_skbs(sq, false);
+ 			if (sq->vq->num_free >= 2+MAX_SKB_FRAGS) {
+ 				netif_start_subqueue(dev, qnum);
+ 				virtqueue_disable_cb(sq->vq);
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 8769b4b8807..499d66701b2 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -433,9 +433,9 @@ static void dev_watchdog(struct timer_list *t)
+ 
+ 				txq = netdev_get_tx_queue(dev, i);
+ 				trans_start = txq->trans_start;
+-				if (netif_xmit_stopped(txq) &&
++				if (netif_xmit_stopped(txq)) {/* &&
+ 				    time_after(jiffies, (trans_start +
+-							 dev->watchdog_timeo))) {
++							 dev->watchdog_timeo))) {*/
+ 					some_queue_timedout = 1;
+ 					txq->trans_timeout++;
+ 					break;
+-- 
+2.17.1
+
