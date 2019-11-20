@@ -5,11 +5,11 @@ Subject: [PATCH 1/2] drivers: net: virtio_net: Adding ndo_tx_timeout sample.
 
 Signed-off-by: Julio Faracco <jcfaracco@gmail.com>
 ---
- drivers/net/virtio_net.c | 170 ++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 169 insertions(+), 1 deletion(-)
+ drivers/net/virtio_net.c | 175 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 174 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
-index 5a635f028bd..d343cc16ae5 100644
+index 5a635f028bd..856626cb205 100644
 --- a/drivers/net/virtio_net.c
 +++ b/drivers/net/virtio_net.c
 @@ -55,6 +55,14 @@ DECLARE_EWMA(pkt_len, 0, 64)
@@ -173,7 +173,7 @@ index 5a635f028bd..d343cc16ae5 100644
  	.get_ts_info = ethtool_op_get_ts_info,
  	.get_link_ksettings = virtnet_get_link_ksettings,
  	.set_link_ksettings = virtnet_set_link_ksettings,
-@@ -2581,6 +2665,28 @@ static int virtnet_set_features(struct net_device *dev,
+@@ -2581,6 +2665,33 @@ static int virtnet_set_features(struct net_device *dev,
  	return 0;
  }
  
@@ -182,18 +182,23 @@ index 5a635f028bd..d343cc16ae5 100644
 +	struct virtnet_info *vi = netdev_priv(dev);
 +	u32 i;
 +
++	netdev_warn(dev, "TX timeout stats:\n");
 +	/* find the stopped queue the same way dev_watchdog() does */
 +	for (i = 0; i < vi->curr_queue_pairs; i++) {
 +		struct send_queue *sq = &vi->sq[i];
 +
-+		if (!netif_xmit_stopped(netdev_get_tx_queue(dev, i)))
++		if (!netif_xmit_stopped(netdev_get_tx_queue(dev, i))) {
++			netdev_warn(dev, " Available send queue: %d, sq: %s, vq: %d, name: %s\n",
++	                            i, sq->name, sq->vq->index, sq->vq->name);
 +			continue;
++		}
 +
 +		u64_stats_update_begin(&sq->stats.syncp);
 +		sq->stats.tx_timeouts++;
 +		u64_stats_update_end(&sq->stats.syncp);
 +
-+		dev->stats.tx_errors++;
++		netdev_warn(dev, " Unavailable send queue: %d, sq: %s, vq: %d, name: %s\n",
++			    i, sq->name, sq->vq->index, sq->vq->name);
 +	}
 +
 +	schedule_work(&vi->reset_work);
@@ -202,7 +207,7 @@ index 5a635f028bd..d343cc16ae5 100644
  static const struct net_device_ops virtnet_netdev = {
  	.ndo_open            = virtnet_open,
  	.ndo_stop   	     = virtnet_close,
-@@ -2596,6 +2702,7 @@ static const struct net_device_ops virtnet_netdev = {
+@@ -2596,6 +2707,7 @@ static const struct net_device_ops virtnet_netdev = {
  	.ndo_features_check	= passthru_features_check,
  	.ndo_get_phys_port_name	= virtnet_get_phys_port_name,
  	.ndo_set_features	= virtnet_set_features,
@@ -210,7 +215,7 @@ index 5a635f028bd..d343cc16ae5 100644
  };
  
  static void virtnet_config_changed_work(struct work_struct *work)
-@@ -2985,6 +3092,14 @@ static int virtnet_validate(struct virtio_device *vdev)
+@@ -2985,6 +3097,14 @@ static int virtnet_validate(struct virtio_device *vdev)
  	return 0;
  }
  
@@ -225,7 +230,7 @@ index 5a635f028bd..d343cc16ae5 100644
  static int virtnet_probe(struct virtio_device *vdev)
  {
  	int i, err = -ENOMEM;
-@@ -3014,6 +3129,7 @@ static int virtnet_probe(struct virtio_device *vdev)
+@@ -3014,6 +3134,7 @@ static int virtnet_probe(struct virtio_device *vdev)
  	dev->netdev_ops = &virtnet_netdev;
  	dev->features = NETIF_F_HIGHDMA;
  
@@ -233,7 +238,7 @@ index 5a635f028bd..d343cc16ae5 100644
  	dev->ethtool_ops = &virtnet_ethtool_ops;
  	SET_NETDEV_DEV(dev, &vdev->dev);
  
-@@ -3071,6 +3187,7 @@ static int virtnet_probe(struct virtio_device *vdev)
+@@ -3071,6 +3192,7 @@ static int virtnet_probe(struct virtio_device *vdev)
  	vdev->priv = vi;
  
  	INIT_WORK(&vi->config_work, virtnet_config_changed_work);
@@ -241,7 +246,7 @@ index 5a635f028bd..d343cc16ae5 100644
  
  	/* If we can receive ANY GSO packets, we must allocate large ones. */
  	if (virtio_has_feature(vdev, VIRTIO_NET_F_GUEST_TSO4) ||
-@@ -3201,6 +3318,20 @@ static int virtnet_probe(struct virtio_device *vdev)
+@@ -3201,6 +3323,20 @@ static int virtnet_probe(struct virtio_device *vdev)
  	return err;
  }
  
@@ -262,7 +267,7 @@ index 5a635f028bd..d343cc16ae5 100644
  static void remove_vq_common(struct virtnet_info *vi)
  {
  	vi->vdev->config->reset(vi->vdev);
-@@ -3261,6 +3392,43 @@ static __maybe_unused int virtnet_restore(struct virtio_device *vdev)
+@@ -3261,6 +3397,43 @@ static __maybe_unused int virtnet_restore(struct virtio_device *vdev)
  	return 0;
  }
  
